@@ -3,7 +3,11 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 from PIL import Image
+
+# Flux2 autoencoder packing factor: (32, h, w) → (128, h/2, w/2)
+PACK_FACTOR = 2
 
 
 class Reface2CropFace:
@@ -160,13 +164,31 @@ class Reface2CropFace:
         target_lat_h = max(1, round(math.sqrt(target_lat_area / aspect)))
         target_lat_w = max(1, round(target_lat_h * aspect))
 
-        # Upscale the cropped latent
-        upscaled = F.interpolate(
-            cropped.float(),
-            size=(target_lat_h, target_lat_w),
+        # -- Upscale latent (unpack → interpolate → repack) -----------------
+        # Flux2 latent is packed: (B, 128, h, w) = (B, 32*2*2, h, w)
+        # which represents (B, 32, 2h, 2w) spatially.
+        # Interpolating directly on the packed 128-ch tensor mixes sub-pixel
+        # channels and creates checkerboard artifacts.  Unpack first so that
+        # bilinear interpolation works at full spatial resolution.
+        pf = PACK_FACTOR
+        unpacked = rearrange(
+            cropped,
+            "b (c pi pj) i j -> b c (i pi) (j pj)",
+            pi=pf, pj=pf,
+        )  # (B, 32, crop_lat_h*2, crop_lat_w*2)
+
+        upscaled_unpacked = F.interpolate(
+            unpacked.float(),
+            size=(target_lat_h * pf, target_lat_w * pf),
             mode="bilinear",
             align_corners=False,
-        ).to(samples.dtype)
+        )
+
+        upscaled = rearrange(
+            upscaled_unpacked,
+            "b c (i pi) (j pj) -> b (c pi pj) i j",
+            pi=pf, pj=pf,
+        ).to(samples.dtype)  # (B, 128, target_lat_h, target_lat_w)
 
         # -- Build output latent -------------------------------------------
         out_latent = {"samples": upscaled}
