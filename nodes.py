@@ -46,6 +46,12 @@ class Reface2CropFace:
     @classmethod
     def _get_detector(cls):
         if cls._detector is None:
+            import math as _math
+
+            # fdlite uses np.math which was removed in numpy 2.0
+            if not hasattr(np, "math"):
+                np.math = _math
+
             from fdlite import FaceDetection, FaceDetectionModel
 
             cls._detector = FaceDetection(
