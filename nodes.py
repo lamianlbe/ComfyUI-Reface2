@@ -77,6 +77,14 @@ class StretchRefRoPE:
 
         model_patched = model.clone()
 
+        # 确认 apply 被调用，以及 patches 写入成功
+        print(f"[StretchRefRoPE] apply() called: stretch_all={stretch_all}, indices_to_stretch={indices_to_stretch}")
+        print(f"[StretchRefRoPE] model_options keys: {list(model_patched.model_options.keys())}")
+        to = model_patched.model_options.get("transformer_options", {})
+        print(f"[StretchRefRoPE] transformer_options keys before patch: {list(to.keys())}")
+        if "patches" in to:
+            print(f"[StretchRefRoPE] existing patches: {list(to['patches'].keys())}")
+
         def stretch_ref_rope_patch(patch_input):
             """post_input patch: 在 PE embedding 计算前修改 ref 部分的坐标"""
             global _debug_counter
@@ -185,6 +193,14 @@ class StretchRefRoPE:
             return {"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids}
 
         model_patched.set_model_patch(stretch_ref_rope_patch, "post_input")
+
+        # 确认 patch 写入成功
+        to_after = model_patched.model_options.get("transformer_options", {})
+        patches_after = to_after.get("patches", {})
+        print(f"[StretchRefRoPE] patches after set_model_patch: {list(patches_after.keys())}")
+        if "post_input" in patches_after:
+            print(f"[StretchRefRoPE] post_input has {len(patches_after['post_input'])} function(s)")
+
         return (model_patched,)
 
 
