@@ -1,236 +1,151 @@
-import math
+"""
+Stretch Ref RoPE — Qwen Image Edit 高分辨率 Pose 修复
+=====================================================
+通过 ComfyUI 的 post_input patch 机制，在 ref_latents 坐标拼接完成后、
+RoPE embedding 计算前，对指定 ref_latent 的位置坐标进行线性拉伸，
+使其覆盖范围与输出 latent 对齐。
 
-import numpy as np
+不修改任何 ComfyUI 核心代码。
+
+原理：
+  model.py _forward 中的执行顺序：
+    1. process_img(x)          → 输出 latent 的 img_ids (num_embeds tokens)
+    2. process_img(ref) × N    → ref_latents 的 kontext_ids 拼接到 img_ids
+    3. "post_input" patches    → ★ 我们在这里修改 img_ids ★
+    4. pe_embedder(ids)        → 计算 RoPE positional embedding
+
+用法：
+  Model Loader → StretchRefRoPE → KSampler
+
+  stretch_indices: 指定要拉伸的 ref_latent 索引（从 1 开始，对应 image1/image2/image3）
+  例如 pose 图在 image1 → 填 "1"
+  例如 pose 图在 image3 → 填 "3"
+  多个用逗号分隔 → "1,3"
+  填 "0" 或留空 → 拉伸全部
+"""
+
 import torch
-import torch.nn.functional as F
-from einops import rearrange
-from PIL import Image
-
-# Flux2 autoencoder packing factor: (32, h, w) → (128, h/2, w/2)
-PACK_FACTOR = 2
 
 
-class Reface2CropFace:
-    """Detect faces in a flux2-klein generated image, crop the corresponding
-    latent region, and upscale it to the target megapixels for identity
-    refinement via a second denoise pass."""
-
-    _detector = None
-
+class StretchRefRoPE:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image": ("IMAGE",),
-                "latent": ("LATENT",),
-                "output_megapixels": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.1, "max": 4.0, "step": 0.1},
-                ),
-                "zero_position_id": (
-                    "BOOLEAN",
-                    {"default": True},
-                ),
-                "max_faces": (
-                    "INT",
-                    {"default": 1, "min": 1, "max": 10, "step": 1},
-                ),
-            }
+                "model": ("MODEL",),
+                "stretch_indices": ("STRING", {
+                    "default": "1",
+                    "tooltip": (
+                        "要拉伸的 ref_latent 索引，从 1 开始，对应 TextEncodeQwenImageEditPlus "
+                        "的 image1/image2/image3 顺序（跳过未连接的）。"
+                        "多个用逗号分隔，如 \"1,3\"。填 \"0\" 或留空则拉伸全部。"
+                    ),
+                }),
+                "enabled": ("BOOLEAN", {"default": True, "tooltip": "启用/禁用 RoPE 坐标拉伸"}),
+            },
         }
 
-    RETURN_TYPES = ("LATENT", "REFACE_CROP_REGION", "FLOAT")
-    RETURN_NAMES = ("face_latent", "crop_region", "recommended_denoise")
-    FUNCTION = "process"
-    CATEGORY = "Reface2"
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "advanced/model"
+    DESCRIPTION = (
+        "将指定 ref_latent 的 RoPE 位置坐标线性拉伸到与输出 latent 相同的范围。"
+        "用于解决高分辨率生成时 OpenPose 引导人物偏向中心的问题，"
+        "同时保持 ref_latent 在 1024² 编码（4096 tokens），不增加计算量。"
+        "通过 stretch_indices 可精确控制只拉伸 pose 图，不影响其他参考图。"
+    )
 
-    # ------------------------------------------------------------------
-    # Face detector (lazy-loaded, shared across instances)
-    # ------------------------------------------------------------------
+    def apply(self, model, stretch_indices="1", enabled=True):
+        if not enabled:
+            return (model,)
 
-    @classmethod
-    def _get_detector(cls):
-        if cls._detector is None:
-            import math as _math
+        # 解析要拉伸的索引（1-based → 0-based）
+        indices_to_stretch = set()
+        stretch_all = False
+        stripped = stretch_indices.strip()
+        if stripped == "" or stripped == "0":
+            stretch_all = True
+        else:
+            for part in stripped.split(","):
+                part = part.strip()
+                if part.isdigit() and int(part) > 0:
+                    indices_to_stretch.add(int(part) - 1)  # 转成 0-based
 
-            # fdlite uses np.math which was removed in numpy 2.0
-            if not hasattr(np, "math"):
-                np.math = _math
+        model_patched = model.clone()
 
-            from fdlite import FaceDetection, FaceDetectionModel
+        def stretch_ref_rope_patch(patch_input):
+            """post_input patch: 在 PE embedding 计算前修改 ref 部分的坐标"""
+            img = patch_input["img"]
+            txt = patch_input["txt"]
+            img_ids = patch_input["img_ids"]
+            txt_ids = patch_input["txt_ids"]
+            transformer_options = patch_input["transformer_options"]
 
-            cls._detector = FaceDetection(
-                model_type=FaceDetectionModel.BACK_CAMERA
-            )
-        return cls._detector
+            ref_num_tokens = transformer_options.get("reference_image_num_tokens", None)
+            if ref_num_tokens is None or len(ref_num_tokens) == 0:
+                return {"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids}
 
-    # ------------------------------------------------------------------
-    # Main logic
-    # ------------------------------------------------------------------
+            total_ref_tokens = sum(ref_num_tokens)
+            num_embeds = img_ids.shape[1] - total_ref_tokens
 
-    def process(
-        self,
-        image: torch.Tensor,
-        latent: dict,
-        output_megapixels: float,
-        zero_position_id: bool,
-        max_faces: int,
-    ):
-        samples = latent["samples"]  # (B, 128, lat_h, lat_w)
-        B, C, lat_h, lat_w = samples.shape
-        img_h, img_w = image.shape[1], image.shape[2]
+            if num_embeds <= 0:
+                return {"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids}
 
-        # Pixel-to-latent scale (should be ~16 for flux2)
-        h_scale = img_h / lat_h
-        w_scale = img_w / lat_w
+            # 获取输出 latent 的 h/w 坐标范围
+            out_h_coords = img_ids[:, :num_embeds, 1]
+            out_w_coords = img_ids[:, :num_embeds, 2]
+            out_h_min = out_h_coords.min().item()
+            out_h_max = out_h_coords.max().item()
+            out_w_min = out_w_coords.min().item()
+            out_w_max = out_w_coords.max().item()
+            out_h_span = out_h_max - out_h_min
+            out_w_span = out_w_max - out_w_min
 
-        # -- empty return helper ------------------------------------------
-        empty_latent = {
-            "samples": torch.zeros(
-                B, C, 1, 1, device=samples.device, dtype=samples.dtype
-            )
-        }
-        empty_result = (empty_latent, None, 0.0)
+            if out_h_span == 0 or out_w_span == 0:
+                return {"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids}
 
-        # -- face detection (CPU, via fdlite) -----------------------------
-        img_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
-        pil_img = Image.fromarray(img_np)
-        detector = self._get_detector()
-        detections = detector(pil_img)
+            # 逐个 ref 处理，只拉伸指定的索引
+            ref_start = num_embeds
+            for ref_idx, ref_tokens in enumerate(ref_num_tokens):
+                ref_end = ref_start + ref_tokens
 
-        if not detections:
-            return empty_result
+                should_stretch = stretch_all or (ref_idx in indices_to_stretch)
+                if not should_stretch:
+                    ref_start = ref_end
+                    continue
 
-        # Gather face bboxes in *pixel* coordinates
-        faces = []
-        for det in detections:
-            bbox = det.bbox
-            # fdlite bbox: xmin, ymin, width, height (normalised 0-1)
-            x = bbox.xmin * img_w
-            y = bbox.ymin * img_h
-            w = bbox.width * img_w
-            h = bbox.height * img_h
-            faces.append({"x": x, "y": y, "w": w, "h": h, "area": w * h})
+                ref_h = img_ids[:, ref_start:ref_end, 1]
+                ref_w = img_ids[:, ref_start:ref_end, 2]
+                ref_h_min = ref_h.min().item()
+                ref_h_max = ref_h.max().item()
+                ref_w_min = ref_w.min().item()
+                ref_w_max = ref_w.max().item()
+                ref_h_span = ref_h_max - ref_h_min
+                ref_w_span = ref_w_max - ref_w_min
 
-        # Sort descending by area
-        faces.sort(key=lambda f: f["area"], reverse=True)
-        max_area = faces[0]["area"]
+                # 只在 ref 范围小于输出范围时拉伸
+                if ref_h_span > 0 and ref_h_span < out_h_span:
+                    h_scale = out_h_span / ref_h_span
+                    ref_h_center = (ref_h_min + ref_h_max) / 2.0
+                    img_ids[:, ref_start:ref_end, 1] = (ref_h - ref_h_center) * h_scale + ref_h_center
 
-        # Keep faces whose area > half of the largest, up to *max_faces*
-        filtered = [f for f in faces if f["area"] > max_area / 2][:max_faces]
+                if ref_w_span > 0 and ref_w_span < out_w_span:
+                    w_scale = out_w_span / ref_w_span
+                    ref_w_center = (ref_w_min + ref_w_max) / 2.0
+                    img_ids[:, ref_start:ref_end, 2] = (ref_w - ref_w_center) * w_scale + ref_w_center
 
-        # Expand each face bbox by 2x (centred)
-        expanded_rects = []
-        for f in filtered:
-            cx = f["x"] + f["w"] / 2
-            cy = f["y"] + f["h"] / 2
-            nw = f["w"] * 2
-            nh = f["h"] * 2
-            expanded_rects.append(
-                (cx - nw / 2, cy - nh / 2, cx + nw / 2, cy + nh / 2)
-            )
+                ref_start = ref_end
 
-        # Minimum bounding rectangle covering all expanded faces
-        px1 = max(0.0, min(r[0] for r in expanded_rects))
-        py1 = max(0.0, min(r[1] for r in expanded_rects))
-        px2 = min(float(img_w), max(r[2] for r in expanded_rects))
-        py2 = min(float(img_h), max(r[3] for r in expanded_rects))
+            return {"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids}
 
-        crop_pixel_area = (px2 - px1) * (py2 - py1)
-        image_pixel_area = img_w * img_h
+        model_patched.set_model_patch(stretch_ref_rope_patch, "post_input")
+        return (model_patched,)
 
-        # If the crop covers >50 % of the image, no optimisation needed
-        if crop_pixel_area > image_pixel_area * 0.5:
-            return empty_result
-
-        # -- Convert pixel crop to latent coordinates ----------------------
-        lx1 = max(0, int(px1 / w_scale))
-        ly1 = max(0, int(py1 / h_scale))
-        lx2 = min(lat_w, math.ceil(px2 / w_scale))
-        ly2 = min(lat_h, math.ceil(py2 / h_scale))
-
-        crop_lat_h = ly2 - ly1
-        crop_lat_w = lx2 - lx1
-        if crop_lat_h <= 0 or crop_lat_w <= 0:
-            return empty_result
-
-        # Crop latent
-        cropped = samples[:, :, ly1:ly2, lx1:lx2]
-
-        # -- Compute target latent size from output megapixels -------------
-        aspect = crop_lat_w / crop_lat_h
-        # Each latent cell covers h_scale * w_scale pixels
-        latent_cell_pixels = h_scale * w_scale
-        target_lat_area = output_megapixels * 1e6 / latent_cell_pixels
-        target_lat_h = max(1, round(math.sqrt(target_lat_area / aspect)))
-        target_lat_w = max(1, round(target_lat_h * aspect))
-
-        # -- Upscale latent (unpack → interpolate → repack) -----------------
-        # Flux2 latent is packed: (B, 128, h, w) = (B, 32*2*2, h, w)
-        # which represents (B, 32, 2h, 2w) spatially.
-        # Interpolating directly on the packed 128-ch tensor mixes sub-pixel
-        # channels and creates checkerboard artifacts.  Unpack first so that
-        # bilinear interpolation works at full spatial resolution.
-        pf = PACK_FACTOR
-        unpacked = rearrange(
-            cropped,
-            "b (c pi pj) i j -> b c (i pi) (j pj)",
-            pi=pf, pj=pf,
-        )  # (B, 32, crop_lat_h*2, crop_lat_w*2)
-
-        upscaled_unpacked = F.interpolate(
-            unpacked.float(),
-            size=(target_lat_h * pf, target_lat_w * pf),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        upscaled = rearrange(
-            upscaled_unpacked,
-            "b c (i pi) (j pj) -> b (c pi pj) i j",
-            pi=pf, pj=pf,
-        ).to(samples.dtype)  # (B, 128, target_lat_h, target_lat_w)
-
-        # -- Build output latent -------------------------------------------
-        out_latent = {"samples": upscaled}
-        if not zero_position_id:
-            # Store the original crop offset so a downstream sampler can
-            # set rope_options.shift_y / shift_x to preserve spatial context.
-            out_latent["position_offset_h"] = ly1
-            out_latent["position_offset_w"] = lx1
-
-        # -- Crop region (for paste-back) ----------------------------------
-        crop_region = {
-            "pixel_x1": int(round(px1)),
-            "pixel_y1": int(round(py1)),
-            "pixel_x2": int(round(px2)),
-            "pixel_y2": int(round(py2)),
-            "lat_x1": lx1,
-            "lat_y1": ly1,
-            "lat_x2": lx2,
-            "lat_y2": ly2,
-            "original_img_h": img_h,
-            "original_img_w": img_w,
-            "original_lat_h": lat_h,
-            "original_lat_w": lat_w,
-            "target_lat_h": target_lat_h,
-            "target_lat_w": target_lat_w,
-        }
-
-        # -- Recommended denoise -------------------------------------------
-        scale_factor = math.sqrt(
-            (target_lat_h * target_lat_w) / (crop_lat_h * crop_lat_w)
-        )
-        denoise = round(min(0.55, 0.2 + 0.05 * scale_factor), 2)
-
-        return (out_latent, crop_region, denoise)
-
-
-# -- Node registration ----------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
-    "Reface2CropFace": Reface2CropFace,
+    "StretchRefRoPE": StretchRefRoPE,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Reface2CropFace": "Reface2 Crop Face (Flux2)",
+    "StretchRefRoPE": "Stretch Ref RoPE (Qwen Image Edit)",
 }
