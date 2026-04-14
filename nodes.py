@@ -200,6 +200,29 @@ class StretchRefRoPE:
         print(f"[StretchRefRoPE] patches after set_model_patch: {list(patches_after.keys())}")
         if "post_input" in patches_after:
             print(f"[StretchRefRoPE] post_input has {len(patches_after['post_input'])} function(s)")
+            print(f"[StretchRefRoPE] post_input func id: {id(patches_after['post_input'][0])}")
+            print(f"[StretchRefRoPE] model_options id: {id(model_patched.model_options)}")
+            print(f"[StretchRefRoPE] transformer_options id: {id(to_after)}")
+            print(f"[StretchRefRoPE] patches dict id: {id(patches_after)}")
+
+        # 额外：用 model_function_wrapper 拦截，看 transformer_options 内容
+        orig_wrapper = model_patched.model_options.get("model_function_wrapper", None)
+        _wrapper_counter = [0]
+        def debug_model_wrapper(apply_model_func, args):
+            if _wrapper_counter[0] < 2:
+                c = args.get("c", {})
+                to = c.get("transformer_options", {})
+                p = to.get("patches", {})
+                print(f"[StretchRefRoPE] === model_function_wrapper called ===")
+                print(f"[StretchRefRoPE] transformer_options keys: {list(to.keys())}")
+                print(f"[StretchRefRoPE] patches keys: {list(p.keys())}")
+                if "post_input" in p:
+                    print(f"[StretchRefRoPE] post_input count: {len(p['post_input'])}")
+                else:
+                    print(f"[StretchRefRoPE] !!! post_input NOT in patches !!!")
+                _wrapper_counter[0] += 1
+            return apply_model_func(args["input"], args["timestep"], **args["c"])
+        model_patched.model_options["model_function_wrapper"] = debug_model_wrapper
 
         return (model_patched,)
 
