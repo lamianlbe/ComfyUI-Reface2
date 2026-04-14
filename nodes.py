@@ -79,7 +79,7 @@ class StretchRefRoPE:
 
         def stretch_ref_rope_patch(patch_input):
             """post_input patch: 在 PE embedding 计算前修改 ref 部分的坐标"""
-            nonlocal _debug_counter
+            global _debug_counter
             img = patch_input["img"]
             txt = patch_input["txt"]
             img_ids = patch_input["img_ids"]
